@@ -8,6 +8,7 @@
 
     <application
         android:allowBackup="true"
+        android:icon="@mipmap/ic_launcher"
         android:label="SwipeClean"
         android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
         <activity
