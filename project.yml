@@ -13,6 +13,8 @@ targets:
       path: Info.plist
       properties:
         CFBundleDisplayName: SwipeClean
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         NSPhotoLibraryUsageDescription: SwipeClean shows your photos so you can swipe to keep or delete them.
         UILaunchScreen: {}
         UISupportedInterfaceOrientations:
