@@ -1,9 +1,6 @@
 // SwipeClean – a tiny swipe-to-clean photo app.
-// Swipe LEFT = mark for deletion, swipe RIGHT = keep.
-// Nothing is deleted until you tap "Delete" and confirm the iOS prompt.
-//
-// Setup: new Xcode project (iOS > App, SwiftUI), replace ContentView.swift with this file,
-// and add the Info key "Privacy - Photo Library Usage Description" (NSPhotoLibraryUsageDescription).
+// Pick a month, then swipe LEFT = mark for deletion, swipe RIGHT = keep.
+// Nothing is deleted until you tap "Delete all" and confirm the iOS prompt.
 
 import SwiftUI
 import Photos
@@ -11,19 +8,27 @@ import UIKit
 
 // MARK: - Model
 
+struct Month: Identifiable {
+    let id: Int            // year * 100 + month, 0 = photos without a date
+    let title: String
+    var assets: [PHAsset]
+    var ids: [String]      // localIdentifiers, parallel to `assets`
+}
+
 @MainActor
 final class PhotoStore: ObservableObject {
     @Published var status: PHAuthorizationStatus = PHPhotoLibrary.authorizationStatus(for: .readWrite)
-    @Published var assets: [PHAsset] = []
-    @Published var index = 0
+    @Published var months: [Month] = []
+    @Published var kept: Set<String> = []
     @Published var trash: [PHAsset] = []
-    @Published var history: [Bool] = []   // true = that swipe was a "delete"
+    @Published var favorites: [String: Bool] = [:]   // local overrides after toggling
+    @Published var deleteGeneration = 0              // bumps whenever photos were really deleted
+    @Published var loaded = false
 
+    private var trashIDs: Set<String> = []
     private let keptKey = "keptPhotoIDs"
-    private var kept: Set<String> = []
 
-    var current: PHAsset? { index < assets.count ? assets[index] : nil }
-    var remaining: Int { max(assets.count - index, 0) }
+    // MARK: Loading
 
     func start() async {
         status = await PHPhotoLibrary.requestAuthorization(for: .readWrite)
@@ -32,75 +37,154 @@ final class PhotoStore: ObservableObject {
         load()
     }
 
-    func load(shuffled: Bool = false) {
+    func load() {
         let options = PHFetchOptions()
         options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
         let result = PHAsset.fetchAssets(with: .image, options: options)
-        var list: [PHAsset] = []
-        list.reserveCapacity(result.count)
+        let calendar = Calendar.current
+        var groups: [Int: [PHAsset]] = [:]
         result.enumerateObjects { asset, _, _ in
-            if !self.kept.contains(asset.localIdentifier) { list.append(asset) }
+            var key = 0
+            if let date = asset.creationDate {
+                let parts = calendar.dateComponents([.year, .month], from: date)
+                key = (parts.year ?? 0) * 100 + (parts.month ?? 0)
+            }
+            groups[key, default: []].append(asset)
         }
-        assets = shuffled ? list.shuffled() : list
-        index = 0
-        trash = []
-        history = []
+        months = groups.keys.sorted(by: >).map { key in
+            let assets = groups[key] ?? []
+            return Month(id: key,
+                         title: PhotoStore.title(for: key),
+                         assets: assets,
+                         ids: assets.map { $0.localIdentifier })
+        }
+        loaded = true
     }
 
-    func swipe(delete: Bool) {
-        guard let asset = current else { return }
-        if delete {
-            trash.append(asset)
-        } else {
-            kept.insert(asset.localIdentifier)
-            saveKept()
-        }
-        history.append(delete)
-        index += 1
+    private static func title(for key: Int) -> String {
+        guard key > 0,
+              let date = Calendar.current.date(from: DateComponents(year: key / 100, month: key % 100))
+        else { return "No date" }
+        return date.formatted(.dateTime.month(.wide).year())
     }
 
-    func undo() {
-        guard let wasDelete = history.popLast(), index > 0 else { return }
-        index -= 1
-        let asset = assets[index]
-        if wasDelete {
-            if !trash.isEmpty { trash.removeLast() }
-        } else {
-            kept.remove(asset.localIdentifier)
-            saveKept()
+    // MARK: Month queries
+
+    func month(_ id: Int) -> Month? { months.first { $0.id == id } }
+
+    func reviewedCount(_ month: Month) -> Int {
+        var count = 0
+        for id in month.ids where kept.contains(id) || trashIDs.contains(id) { count += 1 }
+        return count
+    }
+
+    func isDone(_ month: Month) -> Bool { reviewedCount(month) == month.ids.count }
+
+    var doneMonthCount: Int { months.filter { isDone($0) }.count }
+
+    func unreviewed(in monthID: Int) -> [PHAsset] {
+        guard let month = month(monthID) else { return [] }
+        var list: [PHAsset] = []
+        for (asset, id) in zip(month.assets, month.ids) where !kept.contains(id) && !trashIDs.contains(id) {
+            list.append(asset)
         }
+        return list
+    }
+
+    // MARK: Reviewing
+
+    func keep(_ asset: PHAsset) {
+        kept.insert(asset.localIdentifier)
+        saveKept()
+    }
+
+    func markTrash(_ asset: PHAsset) {
+        let id = asset.localIdentifier
+        guard !trashIDs.contains(id) else { return }
+        trashIDs.insert(id)
+        trash.append(asset)
+    }
+
+    /// Undo: the photo counts as not looked at again.
+    func unreview(_ asset: PHAsset) {
+        let id = asset.localIdentifier
+        if trashIDs.remove(id) != nil {
+            trash.removeAll { $0.localIdentifier == id }
+        }
+        if kept.remove(id) != nil { saveKept() }
     }
 
     /// Take a photo back out of the trash (counts as "keep").
     func restore(_ asset: PHAsset) {
-        trash.removeAll { $0.localIdentifier == asset.localIdentifier }
-        kept.insert(asset.localIdentifier)
+        let id = asset.localIdentifier
+        trashIDs.remove(id)
+        trash.removeAll { $0.localIdentifier == id }
+        kept.insert(id)
         saveKept()
-        history = []   // undo chain no longer matches the trash
+    }
+
+    /// Lets you go through a month again. Photos already in the trash stay there.
+    func resetMonth(_ monthID: Int) {
+        guard let month = month(monthID) else { return }
+        kept.subtract(month.ids)
+        saveKept()
+    }
+
+    func resetAll() {
+        kept = []
+        saveKept()
     }
 
     func emptyTrash() {
         let doomed = trash
         guard !doomed.isEmpty else { return }
+        let gone = Set(doomed.map { $0.localIdentifier })
         PHPhotoLibrary.shared().performChanges({
             PHAssetChangeRequest.deleteAssets(doomed as NSArray)
         }, completionHandler: { success, _ in
             guard success else { return }
-            Task { @MainActor in
-                self.trash = []
-                self.history = []
-            }
+            Task { @MainActor in self.removeDeleted(gone) }
         })
     }
 
-    func resetProgress() {
-        kept = []
-        saveKept()
-        load()
+    private func removeDeleted(_ gone: Set<String>) {
+        var updated: [Month] = []
+        for month in months {
+            var assets: [PHAsset] = []
+            var ids: [String] = []
+            for (asset, id) in zip(month.assets, month.ids) where !gone.contains(id) {
+                assets.append(asset)
+                ids.append(id)
+            }
+            if ids.isEmpty { continue }
+            updated.append(Month(id: month.id, title: month.title, assets: assets, ids: ids))
+        }
+        months = updated
+        trash.removeAll { gone.contains($0.localIdentifier) }
+        trashIDs.subtract(gone)
+        deleteGeneration += 1
     }
 
     private func saveKept() {
         UserDefaults.standard.set(Array(kept), forKey: keptKey)
+    }
+
+    // MARK: Favourites (the real Favourites album in Photos)
+
+    func isFavorite(_ asset: PHAsset) -> Bool {
+        favorites[asset.localIdentifier] ?? asset.isFavorite
+    }
+
+    func toggleFavorite(_ asset: PHAsset) {
+        let id = asset.localIdentifier
+        let newValue = !isFavorite(asset)
+        favorites[id] = newValue
+        PHPhotoLibrary.shared().performChanges({
+            PHAssetChangeRequest(for: asset).isFavorite = newValue
+        }, completionHandler: { success, _ in
+            guard !success else { return }
+            Task { @MainActor in self.favorites[id] = !newValue }
+        })
     }
 }
 
@@ -142,6 +226,23 @@ struct AssetImage: View {
             DispatchQueue.main.async { image = result }
         }
     }
+}
+
+// MARK: - Sharing
+
+struct ShareItem: Identifiable {
+    let id = UUID()
+    let image: UIImage
+}
+
+struct ActivityView: UIViewControllerRepresentable {
+    let items: [Any]
+
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: items, applicationActivities: nil)
+    }
+
+    func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
 }
 
 // MARK: - Swipe card
@@ -241,67 +342,146 @@ struct TrashView: View {
     }
 }
 
-// MARK: - Main screen
-
-struct ContentView: View {
-    @StateObject private var store = PhotoStore()
-    @State private var showTrash = false
+struct TrashButton: View {
+    @ObservedObject var store: PhotoStore
+    @Binding var showTrash: Bool
 
     var body: some View {
-        NavigationStack {
-            Group {
-                switch store.status {
-                case .authorized, .limited: deck
-                case .notDetermined: ProgressView()
-                default: denied
-                }
-            }
-            .navigationTitle("SwipeClean")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    Menu {
-                        Button("Newest first") { store.load() }
-                        Button("Shuffle") { store.load(shuffled: true) }
-                        Button("Reset progress", role: .destructive) { store.resetProgress() }
-                    } label: { Image(systemName: "ellipsis.circle") }
-                }
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button { showTrash = true } label: {
-                        Label("\(store.trash.count)", systemImage: "trash")
-                            .labelStyle(.titleAndIcon)
-                    }
-                    .disabled(store.trash.isEmpty)
-                }
-            }
-            .sheet(isPresented: $showTrash) { TrashView(store: store) }
+        Button { showTrash = true } label: {
+            Label("\(store.trash.count)", systemImage: "trash")
+                .labelStyle(.titleAndIcon)
         }
-        .task { await store.start() }
+        .disabled(store.trash.isEmpty)
     }
+}
 
-    private var deck: some View {
+// MARK: - Month list
+
+struct MonthRow: View {
+    let title: String
+    let reviewed: Int
+    let total: Int
+
+    var body: some View {
+        let done = reviewed == total
+        HStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(title).font(.headline)
+                Text(done ? "Done · \(total) photos" : "\(reviewed) of \(total) reviewed")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                if !done && reviewed > 0 {
+                    ProgressView(value: Double(reviewed), total: Double(total))
+                }
+            }
+            Spacer()
+            if done {
+                Image(systemName: "checkmark.circle.fill")
+                    .font(.title2)
+                    .foregroundStyle(.green)
+            }
+        }
+        .padding(.vertical, 4)
+    }
+}
+
+struct MonthListView: View {
+    @ObservedObject var store: PhotoStore
+    @Binding var showTrash: Bool
+    @State private var confirmReset = false
+
+    var body: some View {
+        List {
+            Section {
+                ForEach(store.months) { month in
+                    NavigationLink(value: month.id) {
+                        MonthRow(title: month.title,
+                                 reviewed: store.reviewedCount(month),
+                                 total: month.ids.count)
+                    }
+                }
+            } header: {
+                Text("\(store.doneMonthCount) of \(store.months.count) months done")
+            }
+        }
+        .overlay {
+            if store.loaded && store.months.isEmpty {
+                Text("No photos found").foregroundStyle(.secondary)
+            }
+        }
+        .safeAreaInset(edge: .bottom) {
+            if !store.trash.isEmpty {
+                Button { showTrash = true } label: {
+                    Text("Review & delete \(store.trash.count)")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.red)
+                .padding()
+                .background(.bar)
+            }
+        }
+        .toolbar {
+            ToolbarItem(placement: .topBarLeading) {
+                Menu {
+                    Button("Reset all progress", role: .destructive) { confirmReset = true }
+                } label: { Image(systemName: "ellipsis.circle") }
+            }
+            ToolbarItem(placement: .topBarTrailing) {
+                TrashButton(store: store, showTrash: $showTrash)
+            }
+        }
+        .confirmationDialog("Mark every month as not reviewed?", isPresented: $confirmReset, titleVisibility: .visible) {
+            Button("Reset all progress", role: .destructive) { store.resetAll() }
+        }
+    }
+}
+
+// MARK: - Swiping through one month
+
+struct DeckView: View {
+    @ObservedObject var store: PhotoStore
+    let monthID: Int
+    @Binding var showTrash: Bool
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var queue: [PHAsset] = []
+    @State private var index = 0
+    @State private var undoFloor = 0      // can't undo past photos that were really deleted
+    @State private var prepared = false
+    @State private var shareItem: ShareItem?
+    @State private var preparingShare = false
+
+    private var current: PHAsset? { index < queue.count ? queue[index] : nil }
+
+    var body: some View {
         VStack(spacing: 14) {
-            Text("\(store.remaining) left")
-                .font(.footnote).foregroundStyle(.secondary)
+            if let asset = current {
+                Text("\(queue.count - index) left")
+                    .font(.footnote).foregroundStyle(.secondary)
 
-            if let asset = store.current {
-                SwipeCard(asset: asset) { store.swipe(delete: $0) }
+                SwipeCard(asset: asset) { act(delete: $0) }
                     .id(asset.localIdentifier)
                     .padding(.horizontal)
+
+                HStack(spacing: 14) {
+                    roundButton("trash.fill", .red) { act(delete: true) }
+                    roundButton("arrow.uturn.backward", .gray) { undo() }
+                        .disabled(index <= undoFloor)
+                    roundButton(store.isFavorite(asset) ? "heart.fill" : "heart", .pink) {
+                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                        store.toggleFavorite(asset)
+                    }
+                    roundButton("square.and.arrow.up", .blue) { share(asset) }
+                        .disabled(preparingShare)
+                    roundButton("checkmark", .green) { act(delete: false) }
+                }
+            } else if prepared {
+                doneView
             } else {
                 Spacer()
-                Image(systemName: "checkmark.circle").font(.system(size: 60)).foregroundStyle(.green)
-                Text("All done").font(.title2.weight(.semibold))
+                ProgressView()
                 Spacer()
-            }
-
-            HStack(spacing: 36) {
-                roundButton("trash.fill", .red) { store.swipe(delete: true) }
-                    .disabled(store.current == nil)
-                roundButton("arrow.uturn.backward", .gray) { store.undo() }
-                    .disabled(store.history.isEmpty)
-                roundButton("heart.fill", .green) { store.swipe(delete: false) }
-                    .disabled(store.current == nil)
             }
 
             if !store.trash.isEmpty {
@@ -315,16 +495,129 @@ struct ContentView: View {
             }
         }
         .padding(.vertical)
+        .navigationTitle(store.month(monthID)?.title ?? "SwipeClean")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                TrashButton(store: store, showTrash: $showTrash)
+            }
+        }
+        .sheet(item: $shareItem) { item in
+            ActivityView(items: [item.image])
+                .presentationDetents([.medium, .large])
+        }
+        .onAppear {
+            if !prepared { rebuild() }
+        }
+        .onChange(of: store.deleteGeneration) {
+            undoFloor = index
+        }
+    }
+
+    private var doneView: some View {
+        VStack(spacing: 14) {
+            Spacer()
+            Image(systemName: "checkmark.circle.fill")
+                .font(.system(size: 64))
+                .foregroundStyle(.green)
+            Text("Month done").font(.title2.weight(.semibold))
+            if !store.trash.isEmpty {
+                Text("Photos you marked are deleted once you confirm below.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal)
+            }
+            Button("Back to months") { dismiss() }
+                .buttonStyle(.borderedProminent)
+            if store.month(monthID) != nil {
+                Button("Review this month again") {
+                    store.resetMonth(monthID)
+                    rebuild()
+                }
+            }
+            Spacer()
+        }
+    }
+
+    private func rebuild() {
+        queue = store.unreviewed(in: monthID)
+        index = 0
+        undoFloor = 0
+        prepared = true
+    }
+
+    private func act(delete: Bool) {
+        guard let asset = current else { return }
+        if delete {
+            store.markTrash(asset)
+        } else {
+            store.keep(asset)
+        }
+        index += 1
+    }
+
+    private func undo() {
+        guard index > undoFloor else { return }
+        index -= 1
+        store.unreview(queue[index])
+    }
+
+    private func share(_ asset: PHAsset) {
+        preparingShare = true
+        let options = PHImageRequestOptions()
+        options.deliveryMode = .highQualityFormat
+        options.isNetworkAccessAllowed = true
+        PHImageManager.default().requestImage(
+            for: asset,
+            targetSize: PHImageManagerMaximumSize,
+            contentMode: .default,
+            options: options
+        ) { result, _ in
+            DispatchQueue.main.async {
+                preparingShare = false
+                if let result { shareItem = ShareItem(image: result) }
+            }
+        }
     }
 
     private func roundButton(_ icon: String, _ color: Color, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Image(systemName: icon)
-                .font(.title2)
+                .font(.title3)
                 .foregroundStyle(color)
-                .frame(width: 62, height: 62)
+                .frame(width: 56, height: 56)
                 .background(Color(.secondarySystemBackground), in: Circle())
         }
+    }
+}
+
+// MARK: - Root
+
+struct ContentView: View {
+    @StateObject private var store = PhotoStore()
+    @State private var showTrash = false
+
+    var body: some View {
+        NavigationStack {
+            Group {
+                switch store.status {
+                case .authorized, .limited:
+                    MonthListView(store: store, showTrash: $showTrash)
+                case .notDetermined:
+                    ProgressView()
+                default:
+                    denied
+                }
+            }
+            .navigationTitle("SwipeClean")
+            .navigationBarTitleDisplayMode(.inline)
+            .navigationDestination(for: Int.self) { monthID in
+                DeckView(store: store, monthID: monthID, showTrash: $showTrash)
+            }
+        }
+        .sheet(isPresented: $showTrash) { TrashView(store: store) }
+        .task { await store.start() }
     }
 
     private var denied: some View {
