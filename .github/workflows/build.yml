@@ -8,6 +8,12 @@ on:
       - ".github/workflows/build.yml"
   workflow_dispatch:
 
+permissions:
+  contents: write
+
+env:
+  APP_VERSION: 1.0.${{ github.run_number }}
+
 jobs:
   build:
     runs-on: macos-15
@@ -27,6 +33,8 @@ jobs:
             -configuration Release \
             -sdk iphoneos \
             -derivedDataPath build \
+            MARKETING_VERSION="$APP_VERSION" \
+            CURRENT_PROJECT_VERSION="${{ github.run_number }}" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
@@ -42,3 +50,13 @@ jobs:
         with:
           name: SwipeClean-ipa
           path: SwipeClean.ipa
+
+      # Public download link for the houndapps source (SideStore / AltStore).
+      - name: Publish release
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v$APP_VERSION" SwipeClean.ipa \
+            --title "SwipeClean $APP_VERSION" \
+            --notes "$(git log -1 --pretty=%s)"
