@@ -642,6 +642,7 @@ struct MonthRow: View {
 struct MonthListView: View {
     @ObservedObject var store: PhotoStore
     @ObservedObject var places: PlaceIndex
+    @ObservedObject var content: ContentIndex
     @Binding var showTrash: Bool
     @State private var confirmReset = false
     @State private var searchText = ""
@@ -654,12 +655,12 @@ struct MonthListView: View {
             if query.isEmpty {
                 monthList
             } else {
-                SearchResultsView(store: store, places: places, query: query)
+                SearchResultsView(store: store, places: places, content: content, query: query)
             }
         }
         .searchable(text: $searchText,
                     placement: .navigationBarDrawer(displayMode: .always),
-                    prompt: "Places, months, screenshots…")
+                    prompt: "Places, things, text, months…")
         .searchSuggestions { suggestions }
         .safeAreaInset(edge: .top, spacing: 0) {
             FilterChips(filters: $filters, text: $searchText, places: places.topPlaces(8))
@@ -718,6 +719,9 @@ struct MonthListView: View {
             ForEach(PhotoFilter.allCases.filter { $0.matches(word: typed) }) { filter in
                 Label(filter.title, systemImage: filter.icon).searchCompletion(filter.title)
             }
+            ForEach(content.suggestions(for: typed), id: \.self) { name in
+                Label(name.capitalized, systemImage: "sparkle.magnifyingglass").searchCompletion(name)
+            }
             ForEach(places.suggestions(for: typed), id: \.self) { name in
                 Label(name, systemImage: "mappin.and.ellipse").searchCompletion(name)
             }
@@ -731,6 +735,7 @@ struct DeckView: View {
     @ObservedObject var store: PhotoStore
     let source: DeckSource
     let places: PlaceIndex
+    let content: ContentIndex
     @Binding var showTrash: Bool
 
     @Environment(\.dismiss) private var dismiss
@@ -838,9 +843,9 @@ struct DeckView: View {
             }
             Button(isMonth ? "Back to months" : "Back to search") { dismiss() }
                 .buttonStyle(.borderedProminent)
-            if !store.assets(for: source, places: places).isEmpty {
+            if !store.assets(for: source, places: places, content: content).isEmpty {
                 Button(isMonth ? "Review this month again" : "Review these again") {
-                    store.reviewAgain(source, places: places)
+                    store.reviewAgain(source, places: places, content: content)
                     rebuild()
                 }
             }
@@ -854,7 +859,7 @@ struct DeckView: View {
     }
 
     private func rebuild() {
-        queue = store.unreviewed(source, places: places)
+        queue = store.unreviewed(source, places: places, content: content)
         index = 0
         undoFloor = 0
         history = []
@@ -913,6 +918,7 @@ struct DeckView: View {
 struct ContentView: View {
     @StateObject private var store = PhotoStore()
     @StateObject private var places = PlaceIndex()
+    @StateObject private var content = ContentIndex()
     @State private var showTrash = false
 
     var body: some View {
@@ -920,7 +926,7 @@ struct ContentView: View {
             Group {
                 switch store.status {
                 case .authorized, .limited:
-                    MonthListView(store: store, places: places, showTrash: $showTrash)
+                    MonthListView(store: store, places: places, content: content, showTrash: $showTrash)
                 case .notDetermined:
                     ProgressView()
                 default:
@@ -930,7 +936,7 @@ struct ContentView: View {
             .navigationTitle("SwipeClean")
             .navigationBarTitleDisplayMode(.inline)
             .navigationDestination(for: DeckSource.self) { source in
-                DeckView(store: store, source: source, places: places, showTrash: $showTrash)
+                DeckView(store: store, source: source, places: places, content: content, showTrash: $showTrash)
             }
         }
         .sheet(isPresented: $showTrash) { TrashView(store: store) }
@@ -947,7 +953,10 @@ struct ContentView: View {
         }
         .task { await store.start() }
         .onChange(of: store.loaded) {
-            if store.loaded { places.start(months: store.months) }
+            if store.loaded {
+                places.start(months: store.months)
+                content.start(months: store.months, screenshots: store.filterIDs[.screenshots] ?? [])
+            }
         }
     }
 

@@ -2,7 +2,8 @@
 // - photo types (favourites, screenshots, selfies, …) come from Photos' own smart albums,
 // - months and years ("march", "2023", "märz 2021") come from the photo dates,
 // - places ("Berlin", a district, a street, a country) come from each photo's location,
-//   which is turned into a place name on the phone and saved, so it only happens once.
+//   which is turned into a place name on the phone and saved, so it only happens once,
+// - things and text in photos come from ContentIndex (on-device recognition).
 
 import SwiftUI
 import Photos
@@ -154,9 +155,10 @@ private struct SearchTerm {
     let month: Int?
     let filters: [PhotoFilter]
     let cells: Set<String>   // places whose name contains the word
+    let photos: Set<String>  // photos showing it, or with it written in them
 
     @MainActor
-    init(_ token: String, places: PlaceIndex) {
+    init(_ token: String, places: PlaceIndex, content: ContentIndex) {
         if token.count == 4, let number = Int(token), (1900...2100).contains(number) {
             year = number
         } else {
@@ -165,6 +167,7 @@ private struct SearchTerm {
         month = MonthWords.numbers[token]
         filters = PhotoFilter.allCases.filter { $0.matches(word: token) }
         cells = places.cells(matching: token)
+        photos = content.photos(matching: token)
     }
 }
 
@@ -180,9 +183,9 @@ extension PhotoStore {
     }
 
     /// Every photo that fits the query, newest first. Each typed word has to fit
-    /// (as a year, a month, a photo type or a place), and so does every chosen filter.
-    func search(_ query: SearchQuery, places: PlaceIndex) -> [PHAsset] {
-        let terms = query.tokens.map { SearchTerm($0, places: places) }
+    /// (as a year, a month, a photo type, a place, or something in the photo), and so does every chosen filter.
+    func search(_ query: SearchQuery, places: PlaceIndex, content: ContentIndex) -> [PHAsset] {
+        let terms = query.tokens.map { SearchTerm($0, places: places, content: content) }
         var results: [PHAsset] = []
         for month in months {
             let year = month.id / 100
@@ -191,7 +194,7 @@ extension PhotoStore {
                 guard query.filters.allSatisfy({ has($0, asset) }) else { continue }
                 let cell = places.cell(of: id)
                 let matched = terms.allSatisfy { term in
-                    fits(term, asset: asset, year: year, month: monthNumber, cell: cell)
+                    fits(term, asset: asset, id: id, year: year, month: monthNumber, cell: cell)
                 }
                 if matched { results.append(asset) }
             }
@@ -199,30 +202,31 @@ extension PhotoStore {
         return results
     }
 
-    private func fits(_ term: SearchTerm, asset: PHAsset, year: Int, month: Int, cell: String?) -> Bool {
+    private func fits(_ term: SearchTerm, asset: PHAsset, id: String, year: Int, month: Int, cell: String?) -> Bool {
         if let wanted = term.year, wanted == year { return true }
         if let wanted = term.month, wanted == month { return true }
         if term.filters.contains(where: { has($0, asset) }) { return true }
         if let cell, term.cells.contains(cell) { return true }
+        if term.photos.contains(id) { return true }
         return false
     }
 
     // MARK: Decks
 
-    func assets(for source: DeckSource, places: PlaceIndex) -> [PHAsset] {
+    func assets(for source: DeckSource, places: PlaceIndex, content: ContentIndex) -> [PHAsset] {
         switch source {
         case .month(let id): return month(id)?.assets ?? []
-        case .search(let query): return search(query, places: places)
+        case .search(let query): return search(query, places: places, content: content)
         }
     }
 
-    func unreviewed(_ source: DeckSource, places: PlaceIndex) -> [PHAsset] {
-        assets(for: source, places: places).filter { !isReviewed($0.localIdentifier) }
+    func unreviewed(_ source: DeckSource, places: PlaceIndex, content: ContentIndex) -> [PHAsset] {
+        assets(for: source, places: places, content: content).filter { !isReviewed($0.localIdentifier) }
     }
 
     /// Lets you go through these photos again. Photos already in the trash stay there.
-    func reviewAgain(_ source: DeckSource, places: PlaceIndex) {
-        unkeep(assets(for: source, places: places).map(\.localIdentifier))
+    func reviewAgain(_ source: DeckSource, places: PlaceIndex, content: ContentIndex) {
+        unkeep(assets(for: source, places: places, content: content).map(\.localIdentifier))
     }
 
     func title(for source: DeckSource) -> String {
@@ -455,12 +459,13 @@ struct FilterChips: View {
 struct SearchResultsView: View {
     @ObservedObject var store: PhotoStore
     @ObservedObject var places: PlaceIndex
+    @ObservedObject var content: ContentIndex
     let query: SearchQuery
 
     private let columns = [GridItem(.adaptive(minimum: 90), spacing: 2)]
 
     var body: some View {
-        let results = store.search(query, places: places)
+        let results = store.search(query, places: places, content: content)
         let open = results.filter { !store.isReviewed($0.localIdentifier) }.count
 
         ScrollView {
@@ -492,10 +497,10 @@ struct SearchResultsView: View {
                 ContentUnavailableView {
                     Label("No photos", systemImage: "magnifyingglass")
                 } description: {
-                    if places.isWorking {
-                        Text("Still finding places (\(places.done) of \(places.total)). Try again in a bit.")
+                    if places.isWorking || content.isWorking {
+                        Text("Still scanning your photos, so more may turn up. Try again in a bit.")
                     } else {
-                        Text("Try a place, a month, a year or a photo type.")
+                        Text("Try a place, a month, a thing like \"dog\", or words in a screenshot.")
                     }
                 }
             }
@@ -503,6 +508,11 @@ struct SearchResultsView: View {
     }
 
     @ViewBuilder private var placesProgress: some View {
+        if content.isWorking {
+            Label("Scanning photos… \(content.done) of \(content.total)", systemImage: "sparkle.magnifyingglass")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+        }
         if places.isWorking {
             Label("Finding places… \(places.done) of \(places.total)", systemImage: "mappin.and.ellipse")
                 .font(.footnote)
