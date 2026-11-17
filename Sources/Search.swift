@@ -190,10 +190,10 @@ extension PhotoStore {
             for (asset, id) in zip(month.assets, month.ids) {
                 guard query.filters.allSatisfy({ has($0, asset) }) else { continue }
                 let cell = places.cell(of: id)
-                let fits = terms.allSatisfy { term in
+                let matched = terms.allSatisfy { term in
                     fits(term, asset: asset, year: year, month: monthNumber, cell: cell)
                 }
-                if fits { results.append(asset) }
+                if matched { results.append(asset) }
             }
         }
         return results
