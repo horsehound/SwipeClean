@@ -1,5 +1,6 @@
 // SwipeClean – a tiny swipe-to-clean photo app.
-// Pick a month, then swipe LEFT = mark for deletion, swipe RIGHT = keep.
+// Pick a month, then swipe LEFT = mark for deletion, swipe RIGHT = keep,
+// swipe UP = keep and add to your swipe-up album (remembered between launches).
 // Nothing is deleted until you tap "Delete all" and confirm the iOS prompt.
 
 import SwiftUI
@@ -15,6 +16,22 @@ struct Month: Identifiable {
     var ids: [String]      // localIdentifiers, parallel to `assets`
 }
 
+enum SwipeAction {
+    case keep, delete, file   // file = keep + add to the swipe-up album
+}
+
+/// Lets a Photos change block hand a value back out.
+private final class Box: @unchecked Sendable {
+    var value: String?
+}
+
+/// Where the swipe-up album choice is saved.
+private enum AlbumDefaults {
+    static let title = "SwipeClean"
+    static let idKey = "swipeUpAlbumID"
+    static let titleKey = "swipeUpAlbumTitle"
+}
+
 @MainActor
 final class PhotoStore: ObservableObject {
     @Published var status: PHAuthorizationStatus = PHPhotoLibrary.authorizationStatus(for: .readWrite)
@@ -25,8 +42,17 @@ final class PhotoStore: ObservableObject {
     @Published var deleteGeneration = 0              // bumps whenever photos were really deleted
     @Published var loaded = false
 
+    // Swipe-up album. Saved in UserDefaults so it sticks between launches.
+    @Published private(set) var albumTitle: String =
+        UserDefaults.standard.string(forKey: AlbumDefaults.titleKey) ?? AlbumDefaults.title
+    /// nil until the album exists in Photos (it's created on the first swipe up).
+    @Published private(set) var albumID: String? = UserDefaults.standard.string(forKey: AlbumDefaults.idKey)
+    @Published var albumMessage: String?             // shown when adding to the album failed
+
     private var trashIDs: Set<String> = []
     private let keptKey = "keptPhotoIDs"
+    private var filed: [String: String] = [:]        // photo id -> album id, for photos this app added
+    private var albumWork: Task<Void, Never>?        // album changes run one after another
 
     // MARK: Loading
 
@@ -35,6 +61,10 @@ final class PhotoStore: ObservableObject {
         guard status == .authorized || status == .limited else { return }
         kept = Set(UserDefaults.standard.stringArray(forKey: keptKey) ?? [])
         load()
+        // Pick up a rename done in Photos.
+        if let album = savedAlbum(), let title = album.localizedTitle, title != albumTitle {
+            saveAlbum(id: album.localIdentifier, title: title)
+        }
     }
 
     func load() {
@@ -106,12 +136,24 @@ final class PhotoStore: ObservableObject {
     }
 
     /// Undo: the photo counts as not looked at again.
-    func unreview(_ asset: PHAsset) {
+    /// `unfile` also takes it back out of the swipe-up album, if SwipeClean put it there.
+    func unreview(_ asset: PHAsset, unfile: Bool = false) {
         let id = asset.localIdentifier
         if trashIDs.remove(id) != nil {
             trash.removeAll { $0.localIdentifier == id }
         }
         if kept.remove(id) != nil { saveKept() }
+        if unfile {
+            enqueueAlbumWork {
+                guard let albumID = self.filed.removeValue(forKey: id),
+                      let album = PHAssetCollection.fetchAssetCollections(
+                          withLocalIdentifiers: [albumID], options: nil).firstObject
+                else { return }
+                _ = await self.perform {
+                    PHAssetCollectionChangeRequest(for: album)?.removeAssets([asset] as NSArray)
+                }
+            }
+        }
     }
 
     /// Take a photo back out of the trash (counts as "keep").
@@ -186,6 +228,118 @@ final class PhotoStore: ObservableObject {
             Task { @MainActor in self.favorites[id] = !newValue }
         })
     }
+
+    // MARK: Swipe-up album (a real album in Photos)
+
+    /// Albums you made in Photos, for the picker.
+    func userAlbums() -> [PHAssetCollection] {
+        let result = PHAssetCollection.fetchAssetCollections(with: .album, subtype: .albumRegular, options: nil)
+        var albums: [PHAssetCollection] = []
+        result.enumerateObjects { album, _, _ in albums.append(album) }
+        return albums.sorted {
+            ($0.localizedTitle ?? "").localizedCaseInsensitiveCompare($1.localizedTitle ?? "") == .orderedAscending
+        }
+    }
+
+    func chooseAlbum(_ album: PHAssetCollection) {
+        saveAlbum(id: album.localIdentifier, title: album.localizedTitle ?? AlbumDefaults.title)
+    }
+
+    /// Use an album by name. It's only created in Photos the first time you swipe up.
+    func chooseNewAlbum(named name: String) {
+        let title = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty else { return }
+        if let existing = userAlbums().first(where: { $0.localizedTitle == title }) {
+            chooseAlbum(existing)
+        } else {
+            saveAlbum(id: nil, title: title)
+        }
+    }
+
+    /// Swipe up: keeps the photo and adds it to the swipe-up album.
+    func file(_ asset: PHAsset) {
+        keep(asset)
+        let id = asset.localIdentifier
+        enqueueAlbumWork {
+            guard let album = await self.ensureAlbum() else {
+                self.albumMessage = "Couldn't create the album \"\(self.albumTitle)\"."
+                return
+            }
+            if self.contains(album, asset) {
+                self.filed.removeValue(forKey: id)   // was already there, so undo leaves it alone
+                return
+            }
+            let ok = await self.perform {
+                PHAssetCollectionChangeRequest(for: album)?.addAssets([asset] as NSArray)
+            }
+            if ok {
+                self.filed[id] = album.localIdentifier
+            } else {
+                self.albumMessage = "Couldn't add the photo to \"\(album.localizedTitle ?? self.albumTitle)\"."
+            }
+        }
+    }
+
+    private func savedAlbum() -> PHAssetCollection? {
+        guard let id = albumID else { return nil }
+        return PHAssetCollection.fetchAssetCollections(withLocalIdentifiers: [id], options: nil).firstObject
+    }
+
+    /// The saved album, or one with the saved name, or a new one.
+    private func ensureAlbum() async -> PHAssetCollection? {
+        if let album = savedAlbum() { return album }
+        let title = albumTitle
+        if let existing = userAlbums().first(where: { $0.localizedTitle == title }) {
+            chooseAlbum(existing)
+            return existing
+        }
+        let created = Box()
+        let ok = await perform {
+            created.value = PHAssetCollectionChangeRequest
+                .creationRequestForAssetCollection(withTitle: title)
+                .placeholderForCreatedAssetCollection.localIdentifier
+        }
+        guard ok, let newID = created.value,
+              let album = PHAssetCollection.fetchAssetCollections(withLocalIdentifiers: [newID], options: nil).firstObject
+        else { return nil }
+        saveAlbum(id: newID, title: title)
+        return album
+    }
+
+    private func contains(_ album: PHAssetCollection, _ asset: PHAsset) -> Bool {
+        let albums = PHAssetCollection.fetchAssetCollectionsContaining(asset, with: .album, options: nil)
+        var found = false
+        albums.enumerateObjects { collection, _, stop in
+            if collection.localIdentifier == album.localIdentifier {
+                found = true
+                stop.pointee = true
+            }
+        }
+        return found
+    }
+
+    private func saveAlbum(id: String?, title: String) {
+        albumID = id
+        albumTitle = title
+        UserDefaults.standard.set(id, forKey: AlbumDefaults.idKey)
+        UserDefaults.standard.set(title, forKey: AlbumDefaults.titleKey)
+    }
+
+    private func enqueueAlbumWork(_ work: @escaping @MainActor () async -> Void) {
+        let previous = albumWork
+        albumWork = Task { @MainActor in
+            await previous?.value
+            await work()
+        }
+    }
+
+    private func perform(_ changes: @escaping () -> Void) async -> Bool {
+        await withCheckedContinuation { continuation in
+            PHPhotoLibrary.shared().performChanges(changes) { success, _ in
+                continuation.resume(returning: success)
+            }
+        }
+    }
 }
 
 // MARK: - Image loading
@@ -249,18 +403,30 @@ struct ActivityView: UIViewControllerRepresentable {
 
 struct SwipeCard: View {
     let asset: PHAsset
-    let onSwipe: (Bool) -> Void
+    let albumTitle: String
+    let onSwipe: (SwipeAction) -> Void
     @State private var offset: CGSize = .zero
 
     private let threshold: CGFloat = 110
+
+    /// The drag counts as "up" while it's more up than sideways.
+    private var goingUp: Bool { -offset.height > abs(offset.width) }
 
     var body: some View {
         AssetImage(asset: asset)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(Color(.secondarySystemBackground))
             .clipShape(RoundedRectangle(cornerRadius: 22))
-            .overlay(alignment: .topLeading) { badge("KEEP", .green).opacity(Double(offset.width / threshold)) }
-            .overlay(alignment: .topTrailing) { badge("DELETE", .red).opacity(Double(-offset.width / threshold)) }
+            .overlay(alignment: .topLeading) {
+                badge(Text("KEEP"), .green).opacity(goingUp ? 0 : Double(offset.width / threshold))
+            }
+            .overlay(alignment: .topTrailing) {
+                badge(Text("DELETE"), .red).opacity(goingUp ? 0 : Double(-offset.width / threshold))
+            }
+            .overlay {
+                badge(Text("\(Image(systemName: "folder.fill")) \(albumTitle)"), .blue)
+                    .opacity(goingUp ? Double(-offset.height / threshold) : 0)
+            }
             .overlay(alignment: .bottom) {
                 if let date = asset.creationDate {
                     Text(date.formatted(date: .abbreviated, time: .omitted))
@@ -270,14 +436,18 @@ struct SwipeCard: View {
                         .padding(10)
                 }
             }
-            .offset(x: offset.width, y: offset.height * 0.25)
+            // Follows the finger upwards; downwards stays damped.
+            .offset(x: offset.width, y: offset.height < 0 ? offset.height : offset.height * 0.25)
             .rotationEffect(.degrees(Double(offset.width) / 22))
             .gesture(
                 DragGesture()
                     .onChanged { offset = $0.translation }
                     .onEnded { value in
-                        if abs(value.translation.width) > threshold {
-                            fling(delete: value.translation.width < 0)
+                        let move = value.translation
+                        if -move.height > threshold && -move.height > abs(move.width) {
+                            fling(.file)
+                        } else if abs(move.width) > threshold {
+                            fling(move.width < 0 ? .delete : .keep)
                         } else {
                             withAnimation(.spring()) { offset = .zero }
                         }
@@ -285,21 +455,99 @@ struct SwipeCard: View {
             )
     }
 
-    private func badge(_ text: String, _ color: Color) -> some View {
-        Text(text)
+    private func badge(_ text: Text, _ color: Color) -> some View {
+        text
             .font(.title3.weight(.heavy))
+            .lineLimit(1)
             .foregroundStyle(color)
             .padding(.horizontal, 12).padding(.vertical, 6)
             .overlay(RoundedRectangle(cornerRadius: 8).stroke(color, lineWidth: 3))
             .padding(18)
     }
 
-    private func fling(delete: Bool) {
+    private func fling(_ action: SwipeAction) {
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
         withAnimation(.easeOut(duration: 0.18)) {
-            offset = CGSize(width: delete ? -700 : 700, height: 0)
+            switch action {
+            case .delete: offset = CGSize(width: -700, height: 0)
+            case .keep: offset = CGSize(width: 700, height: 0)
+            case .file: offset = CGSize(width: offset.width, height: -1100)
+            }
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) { onSwipe(delete) }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) { onSwipe(action) }
+    }
+}
+
+// MARK: - Swipe-up album picker
+
+struct AlbumPicker: View {
+    @ObservedObject var store: PhotoStore
+    @Environment(\.dismiss) private var dismiss
+    @State private var albums: [PHAssetCollection] = []
+    @State private var naming = false
+    @State private var newName = ""
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section {
+                    ForEach(albums, id: \.localIdentifier) { album in
+                        Button {
+                            store.chooseAlbum(album)
+                            dismiss()
+                        } label: {
+                            row(album.localizedTitle ?? "Untitled",
+                                selected: album.localIdentifier == store.albumID)
+                        }
+                    }
+                    // Chosen by name but not in Photos yet (or deleted there).
+                    if !albums.contains(where: { $0.localIdentifier == store.albumID }) {
+                        row(store.albumTitle, note: "created on first swipe up", selected: true)
+                    }
+                } header: {
+                    Text("Swipe up adds the photo to")
+                } footer: {
+                    Text("Your choice is remembered. The photo also stays where it is in your library.")
+                }
+                Section {
+                    Button {
+                        newName = ""
+                        naming = true
+                    } label: {
+                        Label("New album…", systemImage: "plus")
+                    }
+                }
+            }
+            .navigationTitle("Swipe-up album")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } }
+            }
+            .alert("New album", isPresented: $naming) {
+                TextField("Name", text: $newName)
+                Button("Cancel", role: .cancel) {}
+                Button("Use") {
+                    store.chooseNewAlbum(named: newName)
+                    dismiss()
+                }
+            }
+        }
+        .onAppear { albums = store.userAlbums() }
+    }
+
+    private func row(_ title: String, note: String? = nil, selected: Bool) -> some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).foregroundStyle(.primary)
+                if let note {
+                    Text(note).font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            Spacer()
+            if selected {
+                Image(systemName: "checkmark").foregroundStyle(.tint)
+            }
+        }
     }
 }
 
@@ -451,21 +699,35 @@ struct DeckView: View {
     @State private var prepared = false
     @State private var shareItem: ShareItem?
     @State private var preparingShare = false
+    @State private var history: [SwipeAction] = []   // what each swipe did, for undo
+    @State private var showAlbumPicker = false
 
     private var current: PHAsset? { index < queue.count ? queue[index] : nil }
 
     var body: some View {
         VStack(spacing: 14) {
             if let asset = current {
-                Text("\(queue.count - index) left")
-                    .font(.footnote).foregroundStyle(.secondary)
+                HStack {
+                    Text("\(queue.count - index) left")
+                        .font(.footnote).foregroundStyle(.secondary)
+                    Spacer()
+                    Button { showAlbumPicker = true } label: {
+                        Label(store.albumTitle, systemImage: "arrow.up.square")
+                            .lineLimit(1)
+                    }
+                    .font(.footnote.weight(.medium))
+                    .buttonStyle(.bordered)
+                    .buttonBorderShape(.capsule)
+                    .controlSize(.small)
+                }
+                .padding(.horizontal)
 
-                SwipeCard(asset: asset) { act(delete: $0) }
+                SwipeCard(asset: asset, albumTitle: store.albumTitle) { act($0) }
                     .id(asset.localIdentifier)
                     .padding(.horizontal)
 
-                HStack(spacing: 14) {
-                    roundButton("trash.fill", .red) { act(delete: true) }
+                HStack(spacing: 10) {
+                    roundButton("trash.fill", .red) { act(.delete) }
                     roundButton("arrow.uturn.backward", .gray) { undo() }
                         .disabled(index <= undoFloor)
                     roundButton(store.isFavorite(asset) ? "heart.fill" : "heart", .pink) {
@@ -474,7 +736,8 @@ struct DeckView: View {
                     }
                     roundButton("square.and.arrow.up", .blue) { share(asset) }
                         .disabled(preparingShare)
-                    roundButton("checkmark", .green) { act(delete: false) }
+                    roundButton("folder.badge.plus", .indigo) { act(.file) }
+                    roundButton("checkmark", .green) { act(.keep) }
                 }
             } else if prepared {
                 doneView
@@ -504,6 +767,10 @@ struct DeckView: View {
         }
         .sheet(item: $shareItem) { item in
             ActivityView(items: [item.image])
+                .presentationDetents([.medium, .large])
+        }
+        .sheet(isPresented: $showAlbumPicker) {
+            AlbumPicker(store: store)
                 .presentationDetents([.medium, .large])
         }
         .onAppear {
@@ -544,23 +811,26 @@ struct DeckView: View {
         queue = store.unreviewed(in: monthID)
         index = 0
         undoFloor = 0
+        history = []
         prepared = true
     }
 
-    private func act(delete: Bool) {
+    private func act(_ action: SwipeAction) {
         guard let asset = current else { return }
-        if delete {
-            store.markTrash(asset)
-        } else {
-            store.keep(asset)
+        switch action {
+        case .delete: store.markTrash(asset)
+        case .keep: store.keep(asset)
+        case .file: store.file(asset)
         }
+        history.append(action)
         index += 1
     }
 
     private func undo() {
         guard index > undoFloor else { return }
         index -= 1
-        store.unreview(queue[index])
+        let last = history.popLast()
+        store.unreview(queue[index], unfile: last == .file)
     }
 
     private func share(_ asset: PHAsset) {
@@ -586,7 +856,7 @@ struct DeckView: View {
             Image(systemName: icon)
                 .font(.title3)
                 .foregroundStyle(color)
-                .frame(width: 56, height: 56)
+                .frame(width: 50, height: 50)
                 .background(Color(.secondarySystemBackground), in: Circle())
         }
     }
@@ -617,6 +887,17 @@ struct ContentView: View {
             }
         }
         .sheet(isPresented: $showTrash) { TrashView(store: store) }
+        .alert(
+            "Swipe-up album",
+            isPresented: Binding(
+                get: { store.albumMessage != nil },
+                set: { if !$0 { store.albumMessage = nil } }
+            )
+        ) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(store.albumMessage ?? "")
+        }
         .task { await store.start() }
     }
 

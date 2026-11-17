@@ -1,4 +1,5 @@
-// SwipeClean for Android – pick a month, swipe LEFT = mark for deletion, RIGHT = keep.
+// SwipeClean for Android – pick a month, swipe LEFT = mark for deletion, RIGHT = keep,
+// UP = keep and move into your swipe-up folder (remembered between launches).
 // Nothing is removed until you tap "Delete all" and confirm the system prompt.
 
 package com.example.swipeclean
@@ -6,6 +7,7 @@ package com.example.swipeclean
 import android.Manifest
 import android.app.Activity
 import android.content.ContentUris
+import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -14,6 +16,7 @@ import android.os.Build
 import android.os.Bundle
 import android.provider.MediaStore
 import android.provider.Settings
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -36,9 +39,11 @@ import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
@@ -51,6 +56,7 @@ import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.FavoriteBorder
+import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -61,6 +67,7 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -86,12 +93,15 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import coil.compose.AsyncImage
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.time.Instant
 import java.time.YearMonth
@@ -101,12 +111,44 @@ import kotlin.math.abs
 
 // ---------------------------------------------------------------- Model
 
-data class Photo(val id: Long, val uri: Uri, val dateMs: Long, val favorite: Boolean)
+data class Photo(
+    val id: Long,
+    val uri: Uri,
+    val dateMs: Long,
+    val favorite: Boolean,
+    val path: String,   // MediaStore RELATIVE_PATH, e.g. "DCIM/Camera/"
+)
 
 data class Month(val key: Int, val title: String, val photos: List<Photo>)
 
+enum class SwipeAction { KEEP, DELETE, FILE }   // FILE = keep + move into the swipe-up folder
+
 class PhotoStore(private val context: Context) {
     private val prefs = context.getSharedPreferences("swipeclean", Context.MODE_PRIVATE)
+
+    companion object {
+        const val DEFAULT_FOLDER = "Pictures/SwipeClean/"
+
+        /** "Pictures/Holiday/" -> "Holiday" */
+        fun folderName(path: String): String = path.trimEnd('/').substringAfterLast('/')
+
+        fun sameFolder(a: String, b: String): Boolean =
+            a.trimEnd('/').equals(b.trimEnd('/'), ignoreCase = true)
+
+        /** Photos can only be moved into folders under DCIM/ or Pictures/. */
+        fun canHoldPhotos(path: String): Boolean =
+            path.startsWith("DCIM/", ignoreCase = true) || path.startsWith("Pictures/", ignoreCase = true)
+    }
+
+    // Swipe-up folder, saved so it sticks between launches.
+    var folder by mutableStateOf(prefs.getString("folder", null) ?: DEFAULT_FOLDER)
+        private set
+    /** Folders that already have photos in them, for the picker. */
+    var folders by mutableStateOf(listOf<String>())
+        private set
+    private var paths = mapOf<Long, String>()            // where photos are now, after moves
+    private val movedFrom = mutableMapOf<Long, String>() // where SwipeClean moved a photo from, for undo
+    private val moveLock = Mutex()                       // moves run one after another
 
     var loaded by mutableStateOf(false)
         private set
@@ -126,8 +168,14 @@ class PhotoStore(private val context: Context) {
     suspend fun load() {
         val result = withContext(Dispatchers.IO) { queryMonths() }
         months = result
+        folders = sortFolders(result.flatMap { month -> month.photos.map { it.path } } + folder)
         loaded = true
     }
+
+    private fun sortFolders(list: List<String>): List<String> =
+        list.filter { canHoldPhotos(it) }
+            .distinctBy { it.trimEnd('/').lowercase() }
+            .sortedBy { folderName(it).lowercase() }
 
     private fun queryMonths(): List<Month> {
         val photos = ArrayList<Photo>()
@@ -137,18 +185,26 @@ class PhotoStore(private val context: Context) {
             MediaStore.Images.Media.DATE_TAKEN,
             MediaStore.Images.Media.DATE_ADDED,
             MediaStore.MediaColumns.IS_FAVORITE,
+            MediaStore.MediaColumns.RELATIVE_PATH,
         )
         context.contentResolver.query(collection, projection, null, null, null)?.use { cursor ->
             val idCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
             val takenCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_TAKEN)
             val addedCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_ADDED)
             val favCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.IS_FAVORITE)
+            val pathCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.RELATIVE_PATH)
             while (cursor.moveToNext()) {
                 val id = cursor.getLong(idCol)
                 val taken = cursor.getLong(takenCol)
                 val ms = if (taken > 0) taken else cursor.getLong(addedCol) * 1000
                 photos.add(
-                    Photo(id, ContentUris.withAppendedId(collection, id), ms, cursor.getInt(favCol) == 1)
+                    Photo(
+                        id,
+                        ContentUris.withAppendedId(collection, id),
+                        ms,
+                        cursor.getInt(favCol) == 1,
+                        cursor.getString(pathCol) ?: "",
+                    )
                 )
             }
         }
@@ -240,6 +296,51 @@ class PhotoStore(private val context: Context) {
 
     fun setFavorite(id: Long, value: Boolean) {
         favorites = favorites + (id to value)
+    }
+
+    // ------------------------------------------------ Swipe-up folder
+
+    fun chooseFolder(path: String) {
+        folder = path
+        prefs.edit().putString("folder", path).apply()
+        folders = sortFolders(folders + path)
+    }
+
+    /** "Holiday" -> Pictures/Holiday/ (or an existing folder with that name). */
+    fun chooseNewFolder(name: String) {
+        val clean = name.trim().replace("/", "").replace("\\", "")
+        if (clean.isEmpty()) return
+        chooseFolder(folders.firstOrNull { folderName(it).equals(clean, ignoreCase = true) } ?: "Pictures/$clean/")
+    }
+
+    fun isInFolder(photo: Photo): Boolean = sameFolder(paths[photo.id] ?: photo.path, folder)
+
+    /**
+     * Swipe up, once the system prompt allowed the change: moves the photo into the
+     * swipe-up folder. (Keeping it is done by the caller.)
+     */
+    suspend fun file(photo: Photo): Boolean = moveLock.withLock {
+        val from = paths[photo.id] ?: photo.path
+        val ok = move(photo, folder)
+        if (ok) movedFrom[photo.id] = from
+        ok
+    }
+
+    /** Undo of a swipe up: puts the photo back where it was. False if that failed. */
+    suspend fun unfile(photo: Photo): Boolean = moveLock.withLock {
+        val from = movedFrom.remove(photo.id) ?: return@withLock true
+        move(photo, from)
+    }
+
+    private suspend fun move(photo: Photo, target: String): Boolean {
+        val ok = withContext(Dispatchers.IO) {
+            runCatching {
+                val values = ContentValues().apply { put(MediaStore.MediaColumns.RELATIVE_PATH, target) }
+                context.contentResolver.update(photo.uri, values, null, null) > 0
+            }.getOrDefault(false)
+        }
+        if (ok) paths = paths + (photo.id to target)
+        return ok
     }
 
     private fun loadKept(): Set<Long> =
@@ -507,17 +608,68 @@ fun DeckScreen(store: PhotoStore, monthKey: Int, onBack: () -> Unit, onShowTrash
             pendingFavorite = null
         }
 
+    val scope = rememberCoroutineScope()
+    var history by remember { mutableStateOf(listOf<SwipeAction>()) }   // what each swipe did, for undo
+    var showFolderPicker by remember { mutableStateOf(false) }
+    val folderName = PhotoStore.folderName(store.folder)
+
+    /** Brings the last card back, e.g. when moving it into the folder didn't happen. */
+    fun putBack(photo: Photo) {
+        if (index > undoFloor && queue.getOrNull(index - 1)?.id == photo.id) {
+            index--
+            history = history.dropLast(1)
+            store.unreview(photo)
+        }
+    }
+
+    var pendingFile by remember { mutableStateOf<Photo?>(null) }
+    val fileLauncher =
+        rememberLauncherForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) { result ->
+            val photo = pendingFile ?: return@rememberLauncherForActivityResult
+            pendingFile = null
+            if (result.resultCode != Activity.RESULT_OK) {
+                putBack(photo)
+                return@rememberLauncherForActivityResult
+            }
+            scope.launch {
+                if (!store.file(photo)) {
+                    putBack(photo)
+                    Toast.makeText(context, "Couldn't move the photo to $folderName", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+
     val current = queue.getOrNull(index)
 
-    fun act(delete: Boolean) {
+    fun act(action: SwipeAction) {
         val photo = queue.getOrNull(index) ?: return
-        if (delete) store.markTrash(photo) else store.keep(photo)
+        when (action) {
+            SwipeAction.DELETE -> store.markTrash(photo)
+            SwipeAction.KEEP -> store.keep(photo)
+            SwipeAction.FILE -> {
+                store.keep(photo)
+                if (!store.isInFolder(photo)) {
+                    // Android asks before an app may move a photo it didn't take.
+                    pendingFile = photo
+                    val request = MediaStore.createWriteRequest(context.contentResolver, listOf(photo.uri))
+                    fileLauncher.launch(IntentSenderRequest.Builder(request.intentSender).build())
+                }
+            }
+        }
+        history = history + action
         index++
+    }
+
+    if (showFolderPicker) {
+        FolderPicker(store = store, onDismiss = { showFolderPicker = false })
     }
 
     Column(modifier = Modifier.fillMaxSize()) {
         TopBar(title = store.month(monthKey)?.title ?: "SwipeClean", onBack = onBack) {
             if (current != null) {
+                TextButton(onClick = { showFolderPicker = true }, modifier = Modifier.widthIn(max = 150.dp)) {
+                    Text("↑ $folderName", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
                 Text(
                     text = "${queue.size - index} left",
                     style = MaterialTheme.typography.labelLarge,
@@ -535,28 +687,40 @@ fun DeckScreen(store: PhotoStore, monthKey: Int, onBack: () -> Unit, onShowTrash
                     .padding(horizontal = 16.dp, vertical = 8.dp),
             ) {
                 key(current.id) {
-                    SwipeCard(photo = current, onSwipe = { act(it) })
+                    SwipeCard(photo = current, folderName = folderName, onSwipe = { act(it) })
                 }
             }
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(vertical = 8.dp),
-                horizontalArrangement = Arrangement.spacedBy(12.dp, Alignment.CenterHorizontally),
+                horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                FilledTonalIconButton(onClick = { act(true) }, modifier = Modifier.size(56.dp)) {
+                FilledTonalIconButton(onClick = { act(SwipeAction.DELETE) }, modifier = Modifier.size(50.dp)) {
                     Icon(Icons.Filled.Delete, contentDescription = "Delete", tint = Color(0xFFD32F2F))
                 }
                 FilledTonalIconButton(
                     onClick = {
                         if (index > undoFloor) {
                             index--
-                            store.unreview(queue[index])
+                            val photo = queue[index]
+                            val last = history.lastOrNull()
+                            history = history.dropLast(1)
+                            store.unreview(photo)
+                            if (last == SwipeAction.FILE) {
+                                scope.launch {
+                                    if (!store.unfile(photo)) {
+                                        Toast.makeText(
+                                            context, "The photo stays in $folderName", Toast.LENGTH_SHORT
+                                        ).show()
+                                    }
+                                }
+                            }
                         }
                     },
                     enabled = index > undoFloor,
-                    modifier = Modifier.size(56.dp),
+                    modifier = Modifier.size(50.dp),
                 ) {
                     Text("↩", fontSize = 22.sp)
                 }
@@ -570,7 +734,7 @@ fun DeckScreen(store: PhotoStore, monthKey: Int, onBack: () -> Unit, onShowTrash
                         )
                         favoriteLauncher.launch(IntentSenderRequest.Builder(request.intentSender).build())
                     },
-                    modifier = Modifier.size(56.dp),
+                    modifier = Modifier.size(50.dp),
                 ) {
                     Icon(
                         if (favorite) Icons.Filled.Favorite else Icons.Filled.FavoriteBorder,
@@ -587,11 +751,18 @@ fun DeckScreen(store: PhotoStore, monthKey: Int, onBack: () -> Unit, onShowTrash
                         }
                         context.startActivity(Intent.createChooser(send, null))
                     },
-                    modifier = Modifier.size(56.dp),
+                    modifier = Modifier.size(50.dp),
                 ) {
                     Icon(Icons.Filled.Share, contentDescription = "Share")
                 }
-                FilledTonalIconButton(onClick = { act(false) }, modifier = Modifier.size(56.dp)) {
+                FilledTonalIconButton(onClick = { act(SwipeAction.FILE) }, modifier = Modifier.size(50.dp)) {
+                    Icon(
+                        Icons.Filled.KeyboardArrowUp,
+                        contentDescription = "Move to $folderName",
+                        tint = Color(0xFF3949AB),
+                    )
+                }
+                FilledTonalIconButton(onClick = { act(SwipeAction.KEEP) }, modifier = Modifier.size(50.dp)) {
                     Icon(Icons.Filled.Check, contentDescription = "Keep", tint = Color(0xFF2E7D32))
                 }
             }
@@ -628,6 +799,7 @@ fun DeckScreen(store: PhotoStore, monthKey: Int, onBack: () -> Unit, onShowTrash
                         queue = store.unreviewed(monthKey)
                         index = 0
                         undoFloor = 0
+                        history = emptyList()
                     }) { Text("Review this month again") }
                 }
             }
@@ -640,17 +812,23 @@ fun DeckScreen(store: PhotoStore, monthKey: Int, onBack: () -> Unit, onShowTrash
 private val cardDate: DateTimeFormatter = DateTimeFormatter.ofPattern("d MMM yyyy")
 
 @Composable
-fun SwipeCard(photo: Photo, onSwipe: (Boolean) -> Unit) {
+fun SwipeCard(photo: Photo, folderName: String, onSwipe: (SwipeAction) -> Unit) {
     val offsetX = remember { Animatable(0f) }
+    val offsetY = remember { Animatable(0f) }
     val scope = rememberCoroutineScope()
     val currentOnSwipe by rememberUpdatedState(onSwipe)
     var thresholdPx by remember { mutableStateOf(1f) }
+
+    // The drag counts as "up" while it's more up than sideways.
+    fun goingUp() = -offsetY.value > abs(offsetX.value)
 
     Box(
         modifier = Modifier
             .fillMaxSize()
             .graphicsLayer {
                 translationX = offsetX.value
+                // Follows the finger upwards; downwards stays damped.
+                translationY = if (offsetY.value < 0) offsetY.value else offsetY.value * 0.25f
                 rotationZ = offsetX.value / 45f
             }
             .clip(RoundedCornerShape(22.dp))
@@ -659,22 +837,38 @@ fun SwipeCard(photo: Photo, onSwipe: (Boolean) -> Unit) {
                 val threshold = 110.dp.toPx()
                 thresholdPx = threshold
                 val width = size.width.toFloat()
+                val height = size.height.toFloat()
                 detectDragGestures(
                     onDragEnd = {
                         scope.launch {
                             val x = offsetX.value
-                            if (abs(x) > threshold) {
-                                offsetX.animateTo(if (x < 0) -width * 1.5f else width * 1.5f, tween(180))
-                                currentOnSwipe(x < 0)
-                            } else {
-                                offsetX.animateTo(0f)
+                            val y = offsetY.value
+                            when {
+                                -y > threshold && -y > abs(x) -> {
+                                    offsetY.animateTo(-height * 1.5f, tween(180))
+                                    currentOnSwipe(SwipeAction.FILE)
+                                }
+                                abs(x) > threshold -> {
+                                    offsetX.animateTo(if (x < 0) -width * 1.5f else width * 1.5f, tween(180))
+                                    currentOnSwipe(if (x < 0) SwipeAction.DELETE else SwipeAction.KEEP)
+                                }
+                                else -> {
+                                    launch { offsetY.animateTo(0f) }
+                                    offsetX.animateTo(0f)
+                                }
                             }
                         }
                     },
-                    onDragCancel = { scope.launch { offsetX.animateTo(0f) } },
+                    onDragCancel = {
+                        scope.launch { offsetX.animateTo(0f) }
+                        scope.launch { offsetY.animateTo(0f) }
+                    },
                     onDrag = { change, dragAmount ->
                         change.consume()
-                        scope.launch { offsetX.snapTo(offsetX.value + dragAmount.x) }
+                        scope.launch {
+                            offsetX.snapTo(offsetX.value + dragAmount.x)
+                            offsetY.snapTo(offsetY.value + dragAmount.y)
+                        }
                     },
                 )
             },
@@ -690,14 +884,27 @@ fun SwipeCard(photo: Photo, onSwipe: (Boolean) -> Unit) {
             color = Color(0xFF2E7D32),
             modifier = Modifier
                 .align(Alignment.TopStart)
-                .graphicsLayer { alpha = (offsetX.value / thresholdPx).coerceIn(0f, 1f) },
+                .graphicsLayer {
+                    alpha = if (goingUp()) 0f else (offsetX.value / thresholdPx).coerceIn(0f, 1f)
+                },
         )
         Badge(
             text = "DELETE",
             color = Color(0xFFD32F2F),
             modifier = Modifier
                 .align(Alignment.TopEnd)
-                .graphicsLayer { alpha = (-offsetX.value / thresholdPx).coerceIn(0f, 1f) },
+                .graphicsLayer {
+                    alpha = if (goingUp()) 0f else (-offsetX.value / thresholdPx).coerceIn(0f, 1f)
+                },
+        )
+        Badge(
+            text = "↑ $folderName",
+            color = Color(0xFF3949AB),
+            modifier = Modifier
+                .align(Alignment.Center)
+                .graphicsLayer {
+                    alpha = if (goingUp()) (-offsetY.value / thresholdPx).coerceIn(0f, 1f) else 0f
+                },
         )
         Text(
             text = Instant.ofEpochMilli(photo.dateMs).atZone(ZoneId.systemDefault()).format(cardDate),
@@ -719,10 +926,81 @@ fun Badge(text: String, color: Color, modifier: Modifier = Modifier) {
         color = color,
         fontWeight = FontWeight.Black,
         fontSize = 20.sp,
+        maxLines = 1,
+        overflow = TextOverflow.Ellipsis,
         modifier = modifier
             .padding(18.dp)
             .border(3.dp, color, RoundedCornerShape(8.dp))
             .padding(horizontal = 12.dp, vertical = 6.dp),
+    )
+}
+
+// ---------------------------------------------------------------- Swipe-up folder picker
+
+@Composable
+fun FolderPicker(store: PhotoStore, onDismiss: () -> Unit) {
+    var newName by remember { mutableStateOf("") }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Swipe-up folder") },
+        text = {
+            Column {
+                Text(
+                    "Swiping up moves the photo into this folder. Your choice is remembered.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(Modifier.height(8.dp))
+                LazyColumn(modifier = Modifier.heightIn(max = 280.dp)) {
+                    items(store.folders, key = { it }) { path ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable {
+                                    store.chooseFolder(path)
+                                    onDismiss()
+                                }
+                                .padding(vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(PhotoStore.folderName(path))
+                                Text(
+                                    path,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                            if (PhotoStore.sameFolder(path, store.folder)) {
+                                Icon(
+                                    Icons.Filled.Check,
+                                    contentDescription = "Selected",
+                                    tint = MaterialTheme.colorScheme.primary,
+                                )
+                            }
+                        }
+                    }
+                }
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = newName,
+                    onValueChange = { newName = it },
+                    label = { Text("New folder in Pictures") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(
+                enabled = newName.isNotBlank(),
+                onClick = {
+                    store.chooseNewFolder(newName)
+                    onDismiss()
+                },
+            ) { Text("Use new folder") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
     )
 }
 
