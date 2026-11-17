@@ -117,6 +117,8 @@ data class Photo(
     val dateMs: Long,
     val favorite: Boolean,
     val path: String,   // MediaStore RELATIVE_PATH, e.g. "DCIM/Camera/"
+    val width: Int = 0,
+    val height: Int = 0,
 )
 
 data class Month(val key: Int, val title: String, val photos: List<Photo>)
@@ -186,6 +188,8 @@ class PhotoStore(private val context: Context) {
             MediaStore.Images.Media.DATE_ADDED,
             MediaStore.MediaColumns.IS_FAVORITE,
             MediaStore.MediaColumns.RELATIVE_PATH,
+            MediaStore.MediaColumns.WIDTH,
+            MediaStore.MediaColumns.HEIGHT,
         )
         context.contentResolver.query(collection, projection, null, null, null)?.use { cursor ->
             val idCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
@@ -193,6 +197,8 @@ class PhotoStore(private val context: Context) {
             val addedCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_ADDED)
             val favCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.IS_FAVORITE)
             val pathCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.RELATIVE_PATH)
+            val widthCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.WIDTH)
+            val heightCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.HEIGHT)
             while (cursor.moveToNext()) {
                 val id = cursor.getLong(idCol)
                 val taken = cursor.getLong(takenCol)
@@ -204,6 +210,8 @@ class PhotoStore(private val context: Context) {
                         ms,
                         cursor.getInt(favCol) == 1,
                         cursor.getString(pathCol) ?: "",
+                        cursor.getInt(widthCol),
+                        cursor.getInt(heightCol),
                     )
                 )
             }
@@ -271,6 +279,10 @@ class PhotoStore(private val context: Context) {
     /** Lets you go through a month again. Photos already marked for deletion stay marked. */
     fun resetMonth(key: Int) {
         val ids = month(key)?.photos?.map { it.id }?.toSet() ?: return
+        unkeep(ids)
+    }
+
+    fun unkeep(ids: Set<Long>) {
         kept = kept - ids
         saveKept()
     }
@@ -313,7 +325,10 @@ class PhotoStore(private val context: Context) {
         chooseFolder(folders.firstOrNull { folderName(it).equals(clean, ignoreCase = true) } ?: "Pictures/$clean/")
     }
 
-    fun isInFolder(photo: Photo): Boolean = sameFolder(paths[photo.id] ?: photo.path, folder)
+    /** Where the photo is now (it may have been moved by a swipe up). */
+    fun pathOf(photo: Photo): String = paths[photo.id] ?: photo.path
+
+    fun isInFolder(photo: Photo): Boolean = sameFolder(pathOf(photo), folder)
 
     /**
      * Swipe up, once the system prompt allowed the change: moves the photo into the
@@ -360,11 +375,13 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val store = PhotoStore(applicationContext)
+        val places = PlaceIndex(applicationContext)
+        val content = ContentIndex(applicationContext)
         setContent {
             MaterialTheme(colorScheme = if (isSystemInDarkTheme()) darkColorScheme() else lightColorScheme()) {
                 Surface(modifier = Modifier.fillMaxSize()) {
                     Box(modifier = Modifier.safeDrawingPadding()) {
-                        App(store)
+                        App(store, places, content)
                     }
                 }
             }
@@ -373,7 +390,7 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-fun App(store: PhotoStore) {
+fun App(store: PhotoStore, places: PlaceIndex, content: ContentIndex) {
     val context = LocalContext.current
     val permission =
         if (Build.VERSION.SDK_INT >= 33) Manifest.permission.READ_MEDIA_IMAGES
@@ -390,7 +407,29 @@ fun App(store: PhotoStore) {
     LaunchedEffect(Unit) { if (!granted) permissionLauncher.launch(permission) }
     LaunchedEffect(granted) { if (granted) store.load() }
 
-    var monthKey by remember { mutableStateOf<Int?>(null) }
+    // Reading where photos were taken needs its own permission (for place search).
+    var canReadLocation by remember {
+        mutableStateOf(
+            ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_MEDIA_LOCATION) ==
+                PackageManager.PERMISSION_GRANTED
+        )
+    }
+    val locationLauncher =
+        rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { canReadLocation = it }
+    LaunchedEffect(granted) {
+        if (granted && !canReadLocation) locationLauncher.launch(Manifest.permission.ACCESS_MEDIA_LOCATION)
+    }
+
+    // Build the search indexes in the background once the photos are loaded.
+    LaunchedEffect(store.loaded, canReadLocation) {
+        if (store.loaded) places.run(store.months, canReadLocation)
+    }
+    LaunchedEffect(store.loaded) {
+        if (store.loaded) content.run(store.months) { store.has(PhotoFilter.SCREENSHOTS, it) }
+    }
+
+    var deck by remember { mutableStateOf<DeckSource?>(null) }
+    var query by remember { mutableStateOf(SearchQuery()) }
     var showTrash by remember { mutableStateOf(false) }
 
     val trashLauncher =
@@ -410,7 +449,7 @@ fun App(store: PhotoStore) {
         }
     }
 
-    val currentMonth = monthKey
+    val currentDeck = deck
     when {
         !granted -> PermissionScreen(
             onRetry = { permissionLauncher.launch(permission) },
@@ -426,18 +465,24 @@ fun App(store: PhotoStore) {
 
         showTrash -> TrashScreen(store, onBack = { showTrash = false }, onDelete = confirmDelete)
 
-        currentMonth != null -> key(currentMonth) {
+        currentDeck != null -> key(currentDeck) {
             DeckScreen(
                 store = store,
-                monthKey = currentMonth,
-                onBack = { monthKey = null },
+                source = currentDeck,
+                places = places,
+                content = content,
+                onBack = { deck = null },
                 onShowTrash = { showTrash = true },
             )
         }
 
         else -> MonthListScreen(
             store = store,
-            onOpen = { monthKey = it },
+            places = places,
+            content = content,
+            query = query,
+            onQuery = { query = it },
+            onOpen = { deck = it },
             onShowTrash = { showTrash = true },
         )
     }
@@ -501,14 +546,35 @@ fun PermissionScreen(onRetry: () -> Unit, onSettings: () -> Unit) {
 // ---------------------------------------------------------------- Month list
 
 @Composable
-fun MonthListScreen(store: PhotoStore, onOpen: (Int) -> Unit, onShowTrash: () -> Unit) {
+fun MonthListScreen(
+    store: PhotoStore,
+    places: PlaceIndex,
+    content: ContentIndex,
+    query: SearchQuery,
+    onQuery: (SearchQuery) -> Unit,
+    onOpen: (DeckSource) -> Unit,
+    onShowTrash: () -> Unit,
+) {
     var confirmReset by remember { mutableStateOf(false) }
+    BackHandler(enabled = !query.isEmpty) { onQuery(SearchQuery()) }
 
     Column(modifier = Modifier.fillMaxSize()) {
         TopBar(title = "SwipeClean", onBack = null) {
             TextButton(onClick = { confirmReset = true }) { Text("Reset") }
         }
-        if (!store.loaded) {
+        if (store.loaded) {
+            SearchHeader(query = query, onQuery = onQuery, places = places, content = content)
+        }
+        if (store.loaded && !query.isEmpty) {
+            SearchResults(
+                store = store,
+                places = places,
+                content = content,
+                query = query,
+                onOpen = onOpen,
+                modifier = Modifier.weight(1f),
+            )
+        } else if (!store.loaded) {
             Box(modifier = Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
                 CircularProgressIndicator()
             }
@@ -529,7 +595,7 @@ fun MonthListScreen(store: PhotoStore, onOpen: (Int) -> Unit, onShowTrash: () ->
                         title = month.title,
                         reviewed = store.reviewedCount(month),
                         total = month.photos.size,
-                        onClick = { onOpen(month.key) },
+                        onClick = { onOpen(DeckSource.MonthDeck(month.key)) },
                     )
                     HorizontalDivider()
                 }
@@ -589,11 +655,19 @@ fun MonthRow(title: String, reviewed: Int, total: Int, onClick: () -> Unit) {
 // ---------------------------------------------------------------- Swiping through one month
 
 @Composable
-fun DeckScreen(store: PhotoStore, monthKey: Int, onBack: () -> Unit, onShowTrash: () -> Unit) {
+fun DeckScreen(
+    store: PhotoStore,
+    source: DeckSource,
+    places: PlaceIndex,
+    content: ContentIndex,
+    onBack: () -> Unit,
+    onShowTrash: () -> Unit,
+) {
+    val isMonth = source is DeckSource.MonthDeck
     val context = LocalContext.current
     BackHandler(onBack = onBack)
 
-    var queue by remember { mutableStateOf(store.unreviewed(monthKey)) }
+    var queue by remember { mutableStateOf(store.unreviewed(source, places, content)) }
     var index by remember { mutableIntStateOf(0) }
     var undoFloor by remember { mutableIntStateOf(0) }   // can't undo past photos that were removed
     LaunchedEffect(store.generation) { undoFloor = index }
@@ -665,7 +739,7 @@ fun DeckScreen(store: PhotoStore, monthKey: Int, onBack: () -> Unit, onShowTrash
     }
 
     Column(modifier = Modifier.fillMaxSize()) {
-        TopBar(title = store.month(monthKey)?.title ?: "SwipeClean", onBack = onBack) {
+        TopBar(title = store.title(source), onBack = onBack) {
             if (current != null) {
                 TextButton(onClick = { showFolderPicker = true }, modifier = Modifier.widthIn(max = 150.dp)) {
                     Text("↑ $folderName", maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -782,7 +856,7 @@ fun DeckScreen(store: PhotoStore, monthKey: Int, onBack: () -> Unit, onShowTrash
                     modifier = Modifier.size(72.dp),
                 )
                 Spacer(Modifier.height(12.dp))
-                Text("Month done", style = MaterialTheme.typography.headlineSmall)
+                Text(if (isMonth) "Month done" else "All done", style = MaterialTheme.typography.headlineSmall)
                 if (store.trash.isNotEmpty()) {
                     Spacer(Modifier.height(8.dp))
                     Text(
@@ -792,15 +866,15 @@ fun DeckScreen(store: PhotoStore, monthKey: Int, onBack: () -> Unit, onShowTrash
                     )
                 }
                 Spacer(Modifier.height(16.dp))
-                Button(onClick = onBack) { Text("Back to months") }
-                if (store.month(monthKey) != null) {
+                Button(onClick = onBack) { Text(if (isMonth) "Back to months" else "Back to search") }
+                if (store.photosFor(source, places, content).isNotEmpty()) {
                     TextButton(onClick = {
-                        store.resetMonth(monthKey)
-                        queue = store.unreviewed(monthKey)
+                        store.reviewAgain(source, places, content)
+                        queue = store.unreviewed(source, places, content)
                         index = 0
                         undoFloor = 0
                         history = emptyList()
-                    }) { Text("Review this month again") }
+                    }) { Text(if (isMonth) "Review this month again" else "Review these again") }
                 }
             }
         }
