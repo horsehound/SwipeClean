@@ -41,6 +41,7 @@ final class PhotoStore: ObservableObject {
     @Published var favorites: [String: Bool] = [:]   // local overrides after toggling
     @Published var deleteGeneration = 0              // bumps whenever photos were really deleted
     @Published var loaded = false
+    @Published var filterIDs: [PhotoFilter: Set<String>] = [:]   // photo ids in Photos' smart albums
 
     // Swipe-up album. Saved in UserDefaults so it sticks between launches.
     @Published private(set) var albumTitle: String =
@@ -49,7 +50,7 @@ final class PhotoStore: ObservableObject {
     @Published private(set) var albumID: String? = UserDefaults.standard.string(forKey: AlbumDefaults.idKey)
     @Published var albumMessage: String?             // shown when adding to the album failed
 
-    private var trashIDs: Set<String> = []
+    private(set) var trashIDs: Set<String> = []
     private let keptKey = "keptPhotoIDs"
     private var filed: [String: String] = [:]        // photo id -> album id, for photos this app added
     private var albumWork: Task<Void, Never>?        // album changes run one after another
@@ -88,6 +89,7 @@ final class PhotoStore: ObservableObject {
                          assets: assets,
                          ids: assets.map { $0.localIdentifier })
         }
+        filterIDs = PhotoFilter.loadSmartAlbums()
         loaded = true
     }
 
@@ -168,7 +170,11 @@ final class PhotoStore: ObservableObject {
     /// Lets you go through a month again. Photos already in the trash stay there.
     func resetMonth(_ monthID: Int) {
         guard let month = month(monthID) else { return }
-        kept.subtract(month.ids)
+        unkeep(month.ids)
+    }
+
+    func unkeep(_ ids: [String]) {
+        kept.subtract(ids)
         saveKept()
     }
 
@@ -635,27 +641,28 @@ struct MonthRow: View {
 
 struct MonthListView: View {
     @ObservedObject var store: PhotoStore
+    @ObservedObject var places: PlaceIndex
     @Binding var showTrash: Bool
     @State private var confirmReset = false
+    @State private var searchText = ""
+    @State private var filters: Set<PhotoFilter> = []
+
+    private var query: SearchQuery { SearchQuery(text: searchText, filters: filters) }
 
     var body: some View {
-        List {
-            Section {
-                ForEach(store.months) { month in
-                    NavigationLink(value: month.id) {
-                        MonthRow(title: month.title,
-                                 reviewed: store.reviewedCount(month),
-                                 total: month.ids.count)
-                    }
-                }
-            } header: {
-                Text("\(store.doneMonthCount) of \(store.months.count) months done")
+        Group {
+            if query.isEmpty {
+                monthList
+            } else {
+                SearchResultsView(store: store, places: places, query: query)
             }
         }
-        .overlay {
-            if store.loaded && store.months.isEmpty {
-                Text("No photos found").foregroundStyle(.secondary)
-            }
+        .searchable(text: $searchText,
+                    placement: .navigationBarDrawer(displayMode: .always),
+                    prompt: "Places, months, screenshots…")
+        .searchSuggestions { suggestions }
+        .safeAreaInset(edge: .top, spacing: 0) {
+            FilterChips(filters: $filters, text: $searchText, places: places.topPlaces(8))
         }
         .safeAreaInset(edge: .bottom) {
             if !store.trash.isEmpty {
@@ -683,13 +690,47 @@ struct MonthListView: View {
             Button("Reset all progress", role: .destructive) { store.resetAll() }
         }
     }
+
+    private var monthList: some View {
+        List {
+            Section {
+                ForEach(store.months) { month in
+                    NavigationLink(value: DeckSource.month(month.id)) {
+                        MonthRow(title: month.title,
+                                 reviewed: store.reviewedCount(month),
+                                 total: month.ids.count)
+                    }
+                }
+            } header: {
+                Text("\(store.doneMonthCount) of \(store.months.count) months done")
+            }
+        }
+        .overlay {
+            if store.loaded && store.months.isEmpty {
+                Text("No photos found").foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    @ViewBuilder private var suggestions: some View {
+        let typed = searchText.folded.trimmingCharacters(in: .whitespaces)
+        if typed.count >= 2 {
+            ForEach(PhotoFilter.allCases.filter { $0.matches(word: typed) }) { filter in
+                Label(filter.title, systemImage: filter.icon).searchCompletion(filter.title)
+            }
+            ForEach(places.suggestions(for: typed), id: \.self) { name in
+                Label(name, systemImage: "mappin.and.ellipse").searchCompletion(name)
+            }
+        }
+    }
 }
 
-// MARK: - Swiping through one month
+// MARK: - Swiping through a month or search results
 
 struct DeckView: View {
     @ObservedObject var store: PhotoStore
-    let monthID: Int
+    let source: DeckSource
+    let places: PlaceIndex
     @Binding var showTrash: Bool
 
     @Environment(\.dismiss) private var dismiss
@@ -758,7 +799,7 @@ struct DeckView: View {
             }
         }
         .padding(.vertical)
-        .navigationTitle(store.month(monthID)?.title ?? "SwipeClean")
+        .navigationTitle(store.title(for: source))
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
@@ -787,7 +828,7 @@ struct DeckView: View {
             Image(systemName: "checkmark.circle.fill")
                 .font(.system(size: 64))
                 .foregroundStyle(.green)
-            Text("Month done").font(.title2.weight(.semibold))
+            Text(isMonth ? "Month done" : "All done").font(.title2.weight(.semibold))
             if !store.trash.isEmpty {
                 Text("Photos you marked are deleted once you confirm below.")
                     .font(.footnote)
@@ -795,11 +836,11 @@ struct DeckView: View {
                     .multilineTextAlignment(.center)
                     .padding(.horizontal)
             }
-            Button("Back to months") { dismiss() }
+            Button(isMonth ? "Back to months" : "Back to search") { dismiss() }
                 .buttonStyle(.borderedProminent)
-            if store.month(monthID) != nil {
-                Button("Review this month again") {
-                    store.resetMonth(monthID)
+            if !store.assets(for: source, places: places).isEmpty {
+                Button(isMonth ? "Review this month again" : "Review these again") {
+                    store.reviewAgain(source, places: places)
                     rebuild()
                 }
             }
@@ -807,8 +848,13 @@ struct DeckView: View {
         }
     }
 
+    private var isMonth: Bool {
+        if case .month = source { return true }
+        return false
+    }
+
     private func rebuild() {
-        queue = store.unreviewed(in: monthID)
+        queue = store.unreviewed(source, places: places)
         index = 0
         undoFloor = 0
         history = []
@@ -866,6 +912,7 @@ struct DeckView: View {
 
 struct ContentView: View {
     @StateObject private var store = PhotoStore()
+    @StateObject private var places = PlaceIndex()
     @State private var showTrash = false
 
     var body: some View {
@@ -873,7 +920,7 @@ struct ContentView: View {
             Group {
                 switch store.status {
                 case .authorized, .limited:
-                    MonthListView(store: store, showTrash: $showTrash)
+                    MonthListView(store: store, places: places, showTrash: $showTrash)
                 case .notDetermined:
                     ProgressView()
                 default:
@@ -882,8 +929,8 @@ struct ContentView: View {
             }
             .navigationTitle("SwipeClean")
             .navigationBarTitleDisplayMode(.inline)
-            .navigationDestination(for: Int.self) { monthID in
-                DeckView(store: store, monthID: monthID, showTrash: $showTrash)
+            .navigationDestination(for: DeckSource.self) { source in
+                DeckView(store: store, source: source, places: places, showTrash: $showTrash)
             }
         }
         .sheet(isPresented: $showTrash) { TrashView(store: store) }
@@ -899,6 +946,9 @@ struct ContentView: View {
             Text(store.albumMessage ?? "")
         }
         .task { await store.start() }
+        .onChange(of: store.loaded) {
+            if store.loaded { places.start(months: store.months) }
+        }
     }
 
     private var denied: some View {
